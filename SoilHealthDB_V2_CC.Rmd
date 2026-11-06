@@ -1,0 +1,1223 @@
+---
+title: "Effects of cover crops on soil health: a global meta-analysis"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = TRUE, include = TRUE, echo = FALSE,
+                      cache = FALSE, warning = FALSE, fig.height = 4, fig.width = 8)
+
+library(dplyr); library(tidyr); library(stringr); library(ggplot2); library(maps)
+library(metafor); library(patchwork)
+library(igraph); library(ggraph); library(tidygraph)
+
+dir.create("outputs", showWarnings = FALSE)
+```
+
+
+# Site covariates (soil pH, texture, aridity)
+
+Extracts gridded soil properties (SoilGrids 250 m, 0 cm) and the aridity index
+(Global-AI v3) at each site. These columns (PH_0, SAND_0, CLAY_0, AI) are already
+included in `data/SoilHealthDB_V2_CC.csv`, so this chunk is not evaluated by default.
+Raster sources:
+
+- SoilGrids 250 m: https://github.com/ISRICWorldSoil/SoilGrids250m
+- Global Aridity Index v3: https://doi.org/10.6084/m9.figshare.7504448
+
+```{r covariates, eval=FALSE}
+SH <- read.csv("data/SoilHealthDB_V2_CC.csv", header = TRUE,
+               fileEncoding = "UTF-8", na = c("", "NA"))
+
+# SoilGrids, 0 cm depth
+ph_0   <- terra::rast("data/soilgrids/PHIHOX_M_sl1_250m_ll.tif")
+sand_0 <- terra::rast("data/soilgrids/SNDPPT_M_sl1_250m_ll.tif")
+clay_0 <- terra::rast("data/soilgrids/CLYPPT_M_sl1_250m_ll.tif")
+
+pts_sg <- terra::vect(SH, geom = c("Longitude", "Latitude"), crs = terra::crs(ph_0))
+soil_0 <- terra::extract(c(ph_0, sand_0, clay_0), pts_sg, ID = FALSE)
+colnames(soil_0) <- c("PH_0", "SAND_0", "CLAY_0")
+soil_0$PH_0 <- soil_0$PH_0 * 0.1          # pH stored as pH x 10
+
+# Aridity index
+ai <- terra::rast("data/Global-AI_ET0_annual_v3/ai_v3_yr.tif")
+pts_ai <- terra::vect(SH, geom = c("Longitude", "Latitude"), crs = terra::crs(ai))
+ai_ext <- terra::extract(ai, pts_ai, ID = FALSE)
+colnames(ai_ext) <- "AI"
+ai_ext$AI <- ai_ext$AI * 0.0001           # AI stored as AI x 10000
+
+covariates <- cbind(SH[, c("StudyID", "Latitude", "Longitude")], soil_0, ai_ext)
+write.csv(covariates, "data/site_covariates.csv", row.names = FALSE)
+```
+
+
+# Figure 1. Site map
+
+```{r figure1}
+# The data file contains cover crop (CC) observations only
+SHDB_CC <- read.csv("data/SoilHealthDB_V2_CC.csv",
+                    header = TRUE, fileEncoding = "UTF-8", na = c("", "NA"))
+
+# Number of observations per site (point size capped at 75 observations)
+siteInfor_CC <- SHDB_CC %>% dplyr::select(Latitude, Longitude) %>%
+  filter(!is.na(Latitude)) %>% group_by(Latitude, Longitude) %>%
+  tally() %>% mutate(N = ifelse(n >= 75, 75, n), var_size = mean(N) * 0.5 + N * 0.05)
+
+n_obs_CC   <- nrow(SHDB_CC)
+n_study_CC <- n_distinct(SHDB_CC$StudyID)
+
+world <- map_data("world", region = ".", exact = FALSE)
+
+sitemap <- ggplot(world, aes(x = long, y = lat, group = group)) +
+  geom_polygon(color = "white", fill = "gray") +
+  geom_point(data = siteInfor_CC,
+             aes(x = Longitude, y = Latitude, size = var_size),
+             inherit.aes = FALSE,
+             shape = 1, col = "#2ECC71", alpha = 0.7) +
+  geom_point(data = data.frame(x = -178, y = -40), aes(x = x, y = y),
+             inherit.aes = FALSE, shape = 1, col = "#2ECC71", size = 5) +
+  annotate("text", x = -170, y = -40,
+           label = paste0("Cover crops (", n_obs_CC, "/", n_study_CC, ")"),
+           size = 4, hjust = 0) +
+  scale_x_continuous(name = "Longitude", breaks = seq(-180, 180, 30)) +
+  scale_y_continuous(name = "Latitude",  breaks = seq(-60, 90, 20), limits = c(-60, 90)) +
+  theme_bw() +
+  theme(
+    axis.text  = element_text(size = 12),
+    axis.title = element_text(size = 15),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    panel.grid   = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 1.5),
+    legend.position = "none"
+  )
+print(sitemap)
+
+ggsave("outputs/Figure 1.jpg", plot = sitemap, width = 9, height = 4, dpi = 300)
+ggsave("outputs/Figure 1.pdf", plot = sitemap, width = 9, height = 4, units = "in", dpi = 300)
+```
+
+
+# Figure 2. Overall effect sizes
+
+```{r figure2}
+# Indicator categories and colours
+group_list <- list(
+  "Physical properties"      = c("BD","Aggregate","Porosity","SWC","Penetration"),
+  "Chemical properties" = c("OC","N","P","K","pH"),
+  "Biological properties"    = c("SoilFauna","Fungal","Enzyme","Nmineralization"),
+  "Crop productivity"        = c("BiomassCash","Yield"),
+  "Environmental impacts"    = c("Weed","Erosion","Leaching"),
+  "Greenhouse gas emissions" = c("N2O","CO2","CH4"))
+
+group_colors <- c("Physical properties"="#E07B6A","Chemical properties"="#E8A950",
+                  "Biological properties"="#4BADB5","Crop productivity"="#9B7EC8",
+                  "Environmental impacts"="#5E81AC","Greenhouse gas emissions"="#EC9BBC")
+
+assign_group <- function(ind){ for(g in names(group_list)) if(ind %in% group_list[[g]]) return(g); "Other" }
+# Display labels used in figures (internal names follow database column names)
+disp_lab <- c(OC="SOC", Nmineralization="Nmin", BiomassCash="Biomass",
+              N2O="N\u2082O", CO2="CO\u2082", CH4="CH\u2084")
+lab_of <- function(x){ x <- as.character(x); ifelse(x %in% names(disp_lab), disp_lab[x], x) }
+
+# The data file contains cover crop (CC) observations only
+SHDB_CC <- read.csv("data/SoilHealthDB_V2_CC.csv",
+                    header=TRUE, fileEncoding="UTF-8", na=c("","NA"))
+
+# CO2 cleaning: CO2 records from laboratory incubations and composite GHG
+# metrics (CO2 equivalents / GHGI / GWP) are excluded
+co2_cmt_col <- intersect(c("X40CO2_Comments","40CO2_Comments"), colnames(SHDB_CC))[1]
+stopifnot("CO2 comments column not found" = !is.na(co2_cmt_col))
+
+bio_pat <- paste(
+  "basal respiration", "microbial respiration", "substrate.?induced",
+  "from incubation",   "incubation respiration", "anaerobic incubation",
+  "respiratory rate",  "soil microbial",
+  "qco2",              "metabolic quotient",
+  "\\bvial",           "headspace", "sealed jar", "jar incubat",
+  sep = "|")
+ghgi_pat <- "CO2 equivalent|\\bGHGI\\b|\\bGWP\\b"
+
+is_bio_co2  <- !is.na(SHDB_CC[[co2_cmt_col]]) &
+               grepl(bio_pat,  SHDB_CC[[co2_cmt_col]], perl = TRUE, ignore.case = TRUE)
+is_ghgi_co2 <- !is.na(SHDB_CC[[co2_cmt_col]]) &
+               grepl(ghgi_pat, SHDB_CC[[co2_cmt_col]], perl = TRUE, ignore.case = TRUE)
+is_drop_co2 <- is_bio_co2 | is_ghgi_co2
+
+SHDB_CC[is_drop_co2, c("CO2_C","CO2_T","CO2_C_SD","CO2_T_SD")] <- NA
+
+# Background columns and the 22 indicators (each indicator: _C, _T, _C_SD, _T_SD)
+background_name <- c(
+  "StudyID","Latitude","Longitude","Start_year","Sampling_year",
+  "CCMiddleGroup","CC_Termination_method","CC_return_method",
+  "No_C","No_T","PH_0","SAND_0","CLAY_0","AI")
+indicators <- c("BiomassCash_C","Yield_C","BD_C","OC_C","N_C","P_C","K_C","pH_C",
+                "Aggregate_C","Porosity_C","Penetration_C","Erosion_C","Leaching_C","SWC_C",
+                "Weed_C","SoilFauna_C","Fungal_C","Enzyme_C","Nmineralization_C","N2O_C","CO2_C","CH4_C")
+
+response_name <- unlist(lapply(indicators, function(ind){
+  cp <- which(colnames(SHDB_CC)==ind); colnames(SHDB_CC)[cp:(cp+3)] }))
+data_all <- SHDB_CC %>% select(any_of(c(background_name, response_name)))
+bg <- intersect(background_name, colnames(data_all))
+
+resp_cols <- intersect(response_name, colnames(data_all))
+data_all <- data_all %>% mutate(across(all_of(resp_cols), ~ suppressWarnings(as.numeric(.))))
+
+# Global median CV, used as fallback for missing SD imputation
+get_cv <- function(sd, m){ sd<-as.numeric(sd); m<-as.numeric(m); r<-sd/m; median(r[is.finite(r)&m>0], na.rm=TRUE) }
+stack <- do.call(rbind, lapply(indicators, function(ind){
+  cp <- which(colnames(data_all)==ind)
+  data.frame(m=data_all[[cp]], s=data_all[[cp+2]], mt=data_all[[cp+1]], st=data_all[[cp+3]]) }))
+cvC_global <- get_cv(stack$s, stack$m); cvT_global <- get_cv(stack$st, stack$mt)
+
+# lnRR and multilevel random-effects model (random = ~1 | StudyID) for each indicator
+results_all <- data.frame(); effect_data_list <- list()
+
+for (ind in indicators) {
+  cp <- which(colnames(data_all)==ind)
+  ed <- data_all %>% select(all_of(bg), all_of(colnames(data_all)[cp:(cp+3)]))
+  colnames(ed)[(length(bg)+1):ncol(ed)] <- c("C_mean","T_mean","C_SD","T_SD")
+  lab <- substr(ind, 1, nchar(ind)-2)
+
+  ed$No_C <- as.numeric(ed$No_C); ed$No_T <- as.numeric(ed$No_T)
+  ed <- ed %>% filter(!is.na(C_mean), !is.na(T_mean), !is.na(No_C), !is.na(No_T), C_mean>0, T_mean>0)
+  if (nrow(ed) < 3) next
+
+  # Impute missing SD as mean x median CV of the same indicator
+  cvC <- get_cv(ed$C_SD, ed$C_mean); if (!is.finite(cvC)) cvC <- cvC_global
+  cvT <- get_cv(ed$T_SD, ed$T_mean); if (!is.finite(cvT)) cvT <- cvT_global
+  n_pre <- nrow(ed); n_imp <- sum(is.na(ed$C_SD)) + sum(is.na(ed$T_SD))
+  ed <- ed %>% mutate(C_SD=ifelse(is.na(C_SD), C_mean*cvC, C_SD),
+                      T_SD=ifelse(is.na(T_SD), T_mean*cvT, T_SD))
+
+  es <- escalc(measure="ROM", m1i=T_mean, sd1i=T_SD, n1i=No_T,
+                              m2i=C_mean, sd2i=C_SD, n2i=No_C, data=ed)
+  es <- es %>% filter(is.finite(yi), is.finite(vi), vi>0)
+  if (nrow(es) < 3) next
+  effect_data_list[[lab]] <- es
+
+  fit <- tryCatch(rma.mv(yi=yi, V=vi, random=~1|StudyID, data=es, method="REML", sparse=TRUE),
+                  error=function(e) NULL)
+  if (is.null(fit)) next
+  est <- as.numeric(fit$b)[1]; cil <- fit$ci.lb; ciu <- fit$ci.ub; pv <- fit$pval[1]
+  wts <- 1/es$vi; sdP <- sum(wts) - sum(wts^2)/sum(wts)
+  I2 <- 100 * sum(fit$sigma2) / (sum(fit$sigma2) + (fit$k - fit$p)/sdP)
+
+  results_all <- bind_rows(results_all, data.frame(
+    Indicator=lab, LnRR_mean=est, CI_lower=cil, CI_upper=ciu,
+    Pct_mean=(exp(est)-1)*100, Pct_lower=(exp(cil)-1)*100, Pct_upper=(exp(ciu)-1)*100,
+    P_value=pv, N_obs=nrow(es), N_study=length(unique(es$StudyID)),
+    N_imputed_SD=n_imp, Pct_imputed=round(100*n_imp/(2*n_pre),1),
+    I2=round(I2,1), QE=round(fit$QE,1), QE_p=fit$QEp))
+}
+
+# Summary table
+results_summary <- results_all %>%
+  mutate(Group=factor(sapply(Indicator, assign_group), levels=names(group_list)),
+         Indicator=factor(Indicator, levels=unlist(group_list))) %>%
+  arrange(Group, Indicator) %>%
+  mutate(Sig=case_when(P_value<.001~"***",P_value<.01~"**",P_value<.05~"*",P_value<.10~"marginal",TRUE~"ns"),
+         Effect_pct=sprintf("%.1f%%",Pct_mean), CI_95=sprintf("(%.1f%%, %.1f%%)",Pct_lower,Pct_upper),
+         P_value_fmt=ifelse(P_value<.001,"<0.001",sprintf("%.3f",P_value)),
+         Sample=paste0(N_obs,"/",N_study), I2=paste0(I2,"%"), Imputed=paste0(Pct_imputed,"%")) %>%
+  select(Group, Indicator, Effect_pct, CI_95, P_value_fmt, Sig, Sample, I2, Imputed)
+print(as.data.frame(results_summary))
+
+# Forest plot
+results_plot <- results_all %>% filter(Indicator %in% unlist(group_list)) %>%
+  mutate(Group=factor(sapply(Indicator, assign_group), levels=names(group_list)),
+         Significant=ifelse(CI_lower>0 | CI_upper<0,"yes","no"),
+         Point_fill=ifelse(Significant=="yes", sapply(Indicator, assign_group), "white"),
+         Indicator=factor(Indicator, levels=rev(unlist(group_list))))
+panel_labels <- setNames(paste0("(",letters[seq_along(names(group_list))],") ",names(group_list)), names(group_list))
+
+p <- ggplot(results_plot, aes(Pct_mean, Indicator, color=Group)) +
+  geom_errorbarh(aes(xmin=Pct_lower, xmax=Pct_upper), height=.3, linewidth=.9) +
+  geom_point(aes(fill=Point_fill), shape=21, size=5, stroke=1.5) +
+  geom_vline(xintercept=0, linetype="dashed", color="gray50", linewidth=.7) +
+  geom_text(aes(x=Inf, label=paste0(N_obs,"/",N_study)), hjust=1.15, size=7, color="black") +
+  scale_color_manual(values=group_colors) + scale_fill_manual(values=c(group_colors,"white"="white")) +
+  facet_wrap(~Group, nrow=2, ncol=3, scales="free", labeller=labeller(Group=panel_labels)) +
+  scale_x_continuous(expand=expansion(mult=c(.05,.45))) +
+  scale_y_discrete(labels=lab_of) +
+  theme_classic(base_size=28) +
+  theme(plot.title=element_blank(),
+        strip.background=element_rect(fill="gray95",color="black",linewidth=1.2),
+        strip.text=element_text(face="bold",size=22), axis.text.y=element_text(size=22),
+        axis.text.x=element_text(size=20), axis.title.x=element_text(size=24),
+        axis.title.y=element_blank(), legend.position="none",
+        panel.spacing=unit(.8,"lines"), panel.border=element_rect(color="black",fill=NA,linewidth=1.2),
+        panel.grid=element_blank(), axis.ticks=element_line(color="black",linewidth=1.0), axis.line=element_blank()) +
+  labs(x="Mean effect size (%)", y=NULL)
+print(p)
+ggsave("outputs/Figure 2.pdf", p, width=20, height=14, dpi=300)
+ggsave("outputs/Figure 2.jpg", p, width=20, height=14, dpi=300)
+```
+
+
+# Moderator classification
+
+```{r moderators}
+# Cover crop type
+data_all <- data_all %>%
+  mutate(CC_type = case_when(
+    CCMiddleGroup %in% c("Legume","legume")                      ~ "Legume",
+    CCMiddleGroup %in% c("Grass","grass","Rye","rye")            ~ "Grass",
+    CCMiddleGroup %in% c("Brassicaceae","brassicaceae","Broadleaf") ~ "Broadleaf",
+    CCMiddleGroup %in% c("Mixed","Other","weed","MTT","MOT","MMT",
+                         "natural vegetation","AVG","GG","LG","LGG",
+                         "LGB","LB","BG","BGL","BL","LL")         ~ "MMT",
+    is.na(CCMiddleGroup)                                          ~ NA_character_,
+    TRUE                                                          ~ "Other"))
+
+# Termination method
+data_all <- data_all %>%
+  mutate(CC_termination_first = word(CC_Termination_method, 1),
+         CC_termination = case_when(
+    CC_termination_first %in% c("Mechanical","mowing","Roller","disking",
+      "Mechanical（Mulched）","Disked","rolling","Harvested","Disk","Slashing",
+      "plowing","Mechanical,crushed","Mowed","mechanical,stalk","Sweep","Manual",
+      "Plowing","Chopper","mowed","Mowing","mechanical","plow")    ~ "Physical",
+    CC_termination_first %in% c("Chemical","Glyphosate","glyphosate",
+      "Herbicide(Glyphosate)","Herbicide","herbicide","Herbicides","Herbicide,",
+      "Herbicide(Glyphosate),","paraquat","Herbicide(Glyphosate,","Dicamba") ~ "Chemical",
+    CC_termination_first %in% c("Biological","Natural")            ~ "Biological",
+    CC_termination_first %in% c("Integrated","Integrated(mix",
+      "Mechanical/Chemical","Mechanical,Chemical")                 ~ "Integrated",
+    is.na(CC_Termination_method)                                   ~ NA_character_,
+    TRUE                                                           ~ "Other"))
+
+# Residue return method
+data_all <- data_all %>%
+  mutate(CC_return = case_when(
+    CC_return_method %in% c("surface","Surface")           ~ "Surface",
+    CC_return_method %in% c("Incorporated","incorporated") ~ "Incorporated",
+    CC_return_method %in% c("Removed","removed")           ~ "Removed",
+    is.na(CC_return_method)                                ~ NA_character_,
+    TRUE                                                   ~ "Other"))
+
+# Experiment duration
+data_all <- data_all %>%
+  mutate(Years_calc = ifelse(!is.na(Sampling_year) & !is.na(Start_year),
+                             as.numeric(Sampling_year) - as.numeric(Start_year), NA_real_),
+         Duration_group = case_when(
+           is.na(Years_calc) | Years_calc < 0 ~ NA_character_,
+           Years_calc <= 4                    ~ "short (0–4 yr)",
+           Years_calc <= 9                    ~ "medium (5–9 yr)",
+           Years_calc >= 10                   ~ "long (≥ 10 yr)",
+           TRUE                               ~ NA_character_),
+         Duration_group = factor(Duration_group,
+           levels = c("short (0–4 yr)","medium (5–9 yr)","long (≥ 10 yr)")))
+
+# Aridity (AI < 0.65 = dry)
+data_all <- data_all %>%
+  mutate(AI_group = case_when(is.na(AI) ~ NA_character_,
+                              AI <  0.65 ~ "Dry",
+                              AI >= 0.65 ~ "Humid"),
+         AI_group = factor(AI_group, levels = c("Dry","Humid")))
+
+# Soil texture from SoilGrids sand and clay (%)
+data_all <- data_all %>%
+  mutate(Texture_group = case_when(
+    is.na(SAND_0) | is.na(CLAY_0)                  ~ NA_character_,
+    SAND_0 >= 70                & CLAY_0 < 15      ~ "Coarse",
+    SAND_0 >= 50 & SAND_0 < 70  & CLAY_0 < 20      ~ "Coarse",
+    CLAY_0 >= 40                                   ~ "Fine",
+    CLAY_0 >= 27 & CLAY_0 < 40                     ~ "Fine",
+    TRUE                                           ~ "Medium"),
+    Texture_group = factor(Texture_group, levels = c("Coarse","Medium","Fine")))
+
+# Soil pH from SoilGrids
+data_all <- data_all %>%
+  mutate(pH_group = case_when(
+    is.na(PH_0)  ~ NA_character_,
+    PH_0 <  6.5  ~ "Acidic (<6.5)",
+    PH_0 <= 7.5  ~ "Neutral (6.5–7.5)",
+    PH_0 >  7.5  ~ "Alkaline (>7.5)"),
+    pH_group = factor(pH_group,
+      levels = c("Acidic (<6.5)","Neutral (6.5–7.5)","Alkaline (>7.5)")))
+```
+
+
+# Subgroup analysis functions
+
+```{r subgroup-engine}
+# Build effect sizes for one indicator (SD imputation + lnRR), same as Figure 2
+build_es <- function(ind, extra_cols = character(0), df = data_all) {
+  cp <- which(colnames(df) == ind); if (length(cp)==0) return(NULL)
+  keep_bg <- intersect(background_name, colnames(df))
+  ed <- df %>% select(all_of(keep_bg),
+                      all_of(colnames(df)[cp:(cp+3)]),
+                      all_of(intersect(extra_cols, colnames(df))))
+  colnames(ed)[(length(keep_bg)+1):(length(keep_bg)+4)] <- c("C_mean","T_mean","C_SD","T_SD")
+  ed <- ed %>%
+    mutate(across(c(C_mean,T_mean,C_SD,T_SD,No_C,No_T), ~suppressWarnings(as.numeric(.)))) %>%
+    filter(!is.na(C_mean), !is.na(T_mean), !is.na(No_C), !is.na(No_T), C_mean>0, T_mean>0)
+  if (nrow(ed) < 3) return(NULL)
+  cvC <- get_cv(ed$C_SD, ed$C_mean); if (!is.finite(cvC)) cvC <- cvC_global
+  cvT <- get_cv(ed$T_SD, ed$T_mean); if (!is.finite(cvT)) cvT <- cvT_global
+  ed <- ed %>% mutate(is_imp = is.na(C_SD) | is.na(T_SD),
+                      C_SD = ifelse(is.na(C_SD), C_mean*cvC, C_SD),
+                      T_SD = ifelse(is.na(T_SD), T_mean*cvT, T_SD))
+  es <- escalc(measure="ROM", m1i=T_mean, sd1i=T_SD, n1i=No_T,
+                              m2i=C_mean, sd2i=C_SD, n2i=No_C, data=ed)
+  es <- es %>% filter(is.finite(yi), is.finite(vi), vi>0)
+  if (nrow(es) < 3) return(NULL)
+  es
+}
+
+MIN_N_TOTAL <- 10; MIN_N_STUDY <- 3
+
+# Subgroup estimates (separate model per level) and between-group test (QM)
+run_analysis <- function(mod_config, indicators, df = data_all,
+                          min_total_sg = MIN_N_TOTAL,
+                          min_study_sg = MIN_N_STUDY,
+                          min_total_qb = 30) {
+  mod_names <- names(mod_config)
+  sg_list   <- list(); skip_list <- list(); qb_list <- list()
+
+  for (ind in indicators) {
+    es <- build_es(ind, extra_cols = mod_names, df = df)
+    if (is.null(es)) next
+    lab <- substr(ind, 1, nchar(ind)-2)
+
+    # Subgroup estimates
+    for (mod in mod_names) for (lvl in mod_config[[mod]]) {
+      sub <- es[!is.na(es[[mod]]) & as.character(es[[mod]]) == lvl, , drop=FALSE]
+      n_t <- nrow(sub); n_s <- length(unique(sub$StudyID))
+      if (n_t < min_total_sg || n_s < min_study_sg) {
+        skip_list[[length(skip_list)+1]] <- data.frame(
+          Indicator=lab, Moderator=mod, Level=lvl,
+          N_total=n_t, N_study=n_s,
+          Reason=ifelse(n_t<min_total_sg,"too few observations","too few studies"))
+        next
+      }
+      fit <- tryCatch(
+        rma.mv(yi, V=vi, random=~1|StudyID, data=sub, method="REML", sparse=TRUE),
+        error=function(e) NULL)
+      if (is.null(fit)) next
+      est<-as.numeric(fit$b)[1]; cl<-fit$ci.lb; cu<-fit$ci.ub; pv<-fit$pval[1]
+      sg_list[[length(sg_list)+1]] <- data.frame(
+        Indicator=lab, Moderator=mod, Level=lvl,
+        Estimate=est, CI_lower=cl, CI_upper=cu,
+        Pct_mean=(exp(est)-1)*100, Pct_lower=(exp(cl)-1)*100, Pct_upper=(exp(cu)-1)*100,
+        P_value=pv, N_total=n_t, N_study=n_s,
+        Significant=ifelse(cl>0|cu<0,"yes","no"),
+        Sig=case_when(pv<.001~"***",pv<.01~"**",pv<.05~"*",pv<.1~".",TRUE~"ns"))
+    }
+
+    # Between-group omnibus test (meta-regression, mods = ~moderator)
+    for (mod in mod_names) {
+      sub <- es[!is.na(es[[mod]]) &
+                as.character(es[[mod]]) %in% mod_config[[mod]], , drop=FALSE]
+      if (nrow(sub) == 0) next
+      sub$gvar <- droplevels(factor(as.character(sub[[mod]]), levels=mod_config[[mod]]))
+      if (nlevels(sub$gvar) < 2 || nrow(sub) < min_total_qb) next
+      fit <- tryCatch(
+        rma.mv(yi, V=vi, mods=~gvar, random=~1|StudyID, data=sub,
+               method="REML", sparse=TRUE),
+        error=function(e) NULL)
+      if (is.null(fit)) next
+      pb <- fit$QMp
+      qb_list[[length(qb_list)+1]] <- data.frame(
+        Indicator=lab, Moderator=mod, N_total=nrow(sub),
+        N_levels=nlevels(sub$gvar), QM=as.numeric(fit$QM), P_between=pb,
+        Sig_between=case_when(pb<.001~"***",pb<.01~"**",pb<.05~"*",pb<.1~".",TRUE~"ns"))
+    }
+  }
+
+  list(results = if (length(sg_list))   bind_rows(sg_list)   else data.frame(),
+       skipped = if (length(skip_list)) bind_rows(skip_list) else data.frame(),
+       between = if (length(qb_list))   bind_rows(qb_list)   else data.frame())
+}
+```
+
+
+# Subgroup analysis: management and environmental moderators
+
+```{r subgroup-run}
+moderator_display_cc <- list(
+  CC_type        = c("Legume","Grass","Broadleaf","MMT"),
+  CC_termination = c("Chemical","Physical"),
+  CC_return      = c("Incorporated","Surface"))
+moderator_labels_cc <- c(CC_type="Type", CC_termination="Termination method",
+                         CC_return="Return method")
+
+moderator_display_env <- list(
+  Duration_group = c("short (0–4 yr)","medium (5–9 yr)","long (≥ 10 yr)"),
+  AI_group       = c("Dry","Humid"),
+  Texture_group  = c("Coarse","Medium","Fine"),
+  pH_group       = c("Acidic (<6.5)","Neutral (6.5–7.5)","Alkaline (>7.5)"))
+moderator_labels_env <- c(Duration_group="Experiment duration", AI_group="Aridity",
+                          Texture_group="Soil texture", pH_group="Soil pH")
+
+.cc <- run_analysis(moderator_display_cc, indicators)
+results_subgroup       <- .cc$results
+results_heterogeneity  <- .cc$between
+
+.env <- run_analysis(moderator_display_env, indicators)
+results_subgroup_env       <- .env$results
+results_heterogeneity_env  <- .env$between
+
+print(as.data.frame(results_heterogeneity %>% arrange(Moderator, Indicator)))
+print(as.data.frame(results_heterogeneity_env %>% arrange(Moderator, Indicator)))
+```
+
+
+# Plotting functions for Figures 3–6
+
+```{r subgroup-plot-functions}
+# Top panel: distribution of individual lnRR and the pooled estimate (diamond)
+plot_lnrr_top <- function(indicator_name, data_all, ind_color, show_y_axis = TRUE) {
+  col_C <- paste0(indicator_name, "_C")
+  if (!col_C %in% colnames(data_all)) return(ggplot()+theme_void())
+  es <- build_es(col_C, df = data_all)
+  if (is.null(es) || nrow(es)==0) return(ggplot()+theme_void())
+
+  fit <- tryCatch(rma.mv(yi, V=vi, random=~1|StudyID, data=es, method="REML", sparse=TRUE),
+                  error=function(e) NULL)
+  if (is.null(fit)) { mean_lnrr <- weighted.mean(es$yi, 1/es$vi, na.rm=TRUE); pval <- NA }
+  else { mean_lnrr <- as.numeric(fit$b)[1]; pval <- fit$pval[1] }
+  mean_pct  <- (exp(mean_lnrr)-1)*100
+  sig_label <- case_when(is.na(pval)~"", pval<.001~"***", pval<.01~"**",
+                         pval<.05~"*", TRUE~"ns")
+
+  dat_sorted <- es %>% transmute(LnRR=yi, se=sqrt(vi)) %>% arrange(LnRR) %>%
+    mutate(rank=row_number(), ci_low=LnRR-1.96*se, ci_high=LnRR+1.96*se)
+  n_total <- nrow(dat_sorted); y_lim <- c(-1,1)
+
+  ggplot(dat_sorted, aes(rank, LnRR)) +
+    geom_errorbar(aes(ymin=pmax(ci_low, y_lim[1]*1.2), ymax=pmin(ci_high, y_lim[2]*1.2)),
+                  width=0, color=ind_color, alpha=0.18, linewidth=0.3, na.rm=TRUE) +
+    geom_point(color=ind_color, size=0.4, alpha=0.55) +
+    geom_hline(yintercept=0, linetype="dashed", color="gray40", linewidth=0.4) +
+    annotate("point", x=n_total/2, y=mean_lnrr, color=ind_color, fill=ind_color,
+             size=5, shape=23) +
+    annotate("text", x=n_total/2, y=mean_lnrr, label=sprintf("%+.1f%%", mean_pct),
+             vjust=-1.3, size=5.5, fontface="bold", color="black") +
+    annotate("text", x=n_total/2, y=y_lim[2]*0.92, label=sig_label, size=7, fontface="bold") +
+    annotate("text", x=n_total/2, y=y_lim[1]*0.92, label=sprintf("italic(n) == %d", n_total),
+             parse=TRUE, size=5, color="black") +
+    scale_y_continuous(limits=y_lim) +
+    labs(x=NULL, y=if (show_y_axis) "lnRR" else NULL, title=lab_of(indicator_name)) +
+    theme_classic(base_size=14) +
+    theme(axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.line.x=element_blank(),
+          axis.text.y = if (show_y_axis) element_text(size=16) else element_blank(),
+          axis.ticks.y= if (show_y_axis) element_line() else element_blank(),
+          axis.line=element_blank(),
+          axis.title.y= if (show_y_axis) element_text(size=16, margin=margin(r=-3)) else element_blank(),
+          panel.border=element_rect(color="black", fill=NA, linewidth=0.7),
+          plot.title=element_text(hjust=0.5, face="bold", size=22),
+          plot.margin=margin(8,10,4,10))
+}
+
+# Forest plot of subgroup estimates for one indicator
+plot_forest_indicator <- function(indicator_name, results_sg, results_het,
+                                   mod_display, mod_labels, x_limit=NULL, show_y_axis=TRUE) {
+  pd_raw <- results_sg %>% filter(Indicator==indicator_name, !is.na(Pct_mean))
+  if (nrow(pd_raw)==0) return(ggplot()+theme_void())
+
+  total_rows <- 0; mod_info <- list()
+  for (mod in names(mod_display)) { lvls <- mod_display[[mod]]; mod_info[[mod]] <- lvls
+    total_rows <- total_rows + length(lvls) }
+
+  row_df <- data.frame(); sep_y <- c(); current_row <- total_rows; first_mod <- TRUE
+  for (mod in names(mod_info)) {
+    lvls <- mod_info[[mod]]
+    if (!first_mod) { sep_y <- c(sep_y, current_row + 0.5); current_row <- current_row - 0.5 }
+    first_mod <- FALSE
+    for (lvl in lvls) {
+      row_df <- bind_rows(row_df, data.frame(Moderator=mod, Level=lvl,
+                row_pos=current_row, stringsAsFactors=FALSE))
+      current_row <- current_row - 1 }
+  }
+
+  pd <- row_df %>% left_join(pd_raw, by=c("Moderator","Level")) %>%
+    mutate(Indicator=indicator_name)
+  if (nrow(results_het) > 0)
+    pd <- pd %>% left_join(results_het %>% select(Indicator, Moderator, P_between),
+                           by=c("Indicator","Moderator"))
+  else pd$P_between <- NA_real_
+
+  pd <- pd %>% mutate(Significant=ifelse(CI_lower>0 | CI_upper<0,"yes","no"),
+                      ind_color=group_colors[sapply(Indicator, assign_group)],
+                      point_fill=ifelse(Significant=="yes", ind_color, "white"))
+  ind_color <- unique(pd$ind_color)[1]
+
+  if (is.null(x_limit)) {
+    x_max <- max(abs(c(pd$Pct_lower, pd$Pct_upper)), na.rm=TRUE)
+    x_max <- ceiling(x_max/10)*10; x_limit <- c(-x_max, x_max) }
+  x_limit_plot <- c(x_limit[1], x_limit[2]*1.60)
+
+  # Moderator label with between-group significance: (*) p < 0.05, ns otherwise
+  mod_label_df <- pd %>% group_by(Moderator) %>%
+    summarise(y_label=max(row_pos)+0.5, P_between=first(P_between), .groups="drop") %>%
+    mutate(p_label=case_when(is.na(P_between)~"", P_between<0.05~"*", TRUE~"ns"),
+           mod_text=paste0(mod_labels[Moderator],
+                           ifelse(p_label!="", paste0("  (", p_label, ")"), "")))
+
+  p <- ggplot(pd, aes(Pct_mean, row_pos)) +
+    geom_vline(xintercept=0, linetype="dashed", color="gray50", linewidth=0.5) +
+    {if (length(sep_y)>0) geom_hline(yintercept=sep_y, linetype="dashed",
+                                     color="gray70", linewidth=0.4)} +
+    geom_errorbarh(aes(xmin=pmax(Pct_lower, x_limit[1]), xmax=pmin(Pct_upper, x_limit[2])),
+                   height=0.35, linewidth=0.9, color=ind_color, na.rm=TRUE) +
+    geom_point(aes(fill=point_fill), shape=21, size=4, stroke=1.6, color=ind_color, na.rm=TRUE) +
+    scale_fill_identity() +
+    geom_text(data=function(d) filter(d, !is.na(N_total)),
+              aes(x=x_limit_plot[2], label=paste0(N_total,"/",N_study)),
+              hjust=1.05, size=5, color="black") +
+    coord_cartesian(xlim=x_limit_plot, clip="off") +
+    scale_x_continuous(breaks=scales::pretty_breaks()(x_limit),
+                       expand=expansion(mult=c(0.02,0.02))) +
+    scale_y_continuous(breaks=pd$row_pos,
+                       labels=ifelse(pd$Level=="MMT","Mixed", pd$Level),
+                       limits=c(min(pd$row_pos)-0.3, max(pd$row_pos)+0.7), expand=c(0,0)) +
+    labs(x=NULL, y=NULL) +
+    theme_classic(base_size=16) +
+    theme(axis.title.y=element_blank(),
+          axis.text.y = if (show_y_axis) element_text(size=16) else element_blank(),
+          axis.ticks.y= if (show_y_axis) element_line() else element_blank(),
+          axis.text.x =element_text(size=14), axis.line=element_blank(),
+          panel.border=element_rect(color="black", fill=NA, linewidth=0.7),
+          plot.title=element_text(hjust=0.5, face="bold", size=22),
+          plot.margin=margin(t=4, r=10, b=4, l=5))
+  p + geom_text(data=mod_label_df, aes(x=x_limit[1], y=y_label, label=mod_text),
+                hjust=0, vjust=0.5, size=16/.pt, fontface="plain",
+                color="black", inherit.aes=FALSE)
+}
+
+# One indicator panel (optional lnRR distribution on top of the forest plot)
+make_indicator_panel <- function(indicator_name, data_all, results_sg, results_het,
+                                 mod_display, mod_labels, panel_label=NULL,
+                                 show_y_axis=TRUE, show_lnrr_top=TRUE) {
+  ind_color <- group_colors[assign_group(indicator_name)]
+  p_forest <- plot_forest_indicator(indicator_name, results_sg, results_het,
+                                     mod_display, mod_labels, show_y_axis=show_y_axis)
+  if (show_lnrr_top) {
+    p_top <- plot_lnrr_top(indicator_name, data_all, ind_color, show_y_axis)
+    if (!is.null(panel_label)) {
+      tag_x <- if (show_y_axis) 0.25 else 0.02
+      p_top <- p_top + labs(tag=panel_label) +
+        theme(plot.tag=element_text(face="bold", size=20), plot.tag.position=c(tag_x, 0.93)) }
+    return(p_top / p_forest + plot_layout(heights=c(1, 3.5)))
+  } else {
+    p_forest <- p_forest + labs(title=lab_of(indicator_name))
+    if (!is.null(panel_label)) {
+      tag_x <- if (show_y_axis) 0.30 else 0.02
+      p_forest <- p_forest + labs(tag=panel_label) +
+        theme(plot.tag=element_text(face="bold", size=20), plot.tag.position=c(tag_x, 0.97)) }
+    return(p_forest)
+  }
+}
+
+# Multi-panel figure
+make_figure <- function(indicator_names, data_all, results_sg, results_het,
+                        mod_display, mod_labels, panel_widths=NULL, show_lnrr_top=TRUE) {
+  tags <- paste0("(", letters[seq_along(indicator_names)], ")")
+  panels <- lapply(seq_along(indicator_names), function(i)
+    make_indicator_panel(indicator_names[i], data_all, results_sg, results_het,
+                         mod_display, mod_labels, panel_label=tags[i],
+                         show_y_axis=(i==1), show_lnrr_top=show_lnrr_top))
+  if (is.null(panel_widths)) panel_widths <- rep(1, length(indicator_names))
+  wrap_plots(panels, nrow=1, widths=panel_widths) +
+    plot_annotation(caption="Mean effect size (%)",
+      theme=theme(plot.caption=element_text(hjust=0.5, size=18, color="black",
+                                            margin=margin(t=10, b=4))))
+}
+```
+
+
+# Figures 3–6. Subgroup results
+
+```{r figures3-6}
+inds_set1 <- c("Aggregate","OC","N","Enzyme","Nmineralization")   # Figures 3 and 5
+inds_set2 <- c("Yield","Weed","Leaching","CO2","N2O")             # Figures 4 and 6
+
+# Figures 3-4: management moderators
+fig3 <- make_figure(inds_set1, data_all,
+                    results_subgroup, results_heterogeneity,
+                    moderator_display_cc, moderator_labels_cc, show_lnrr_top=TRUE)
+fig4 <- make_figure(inds_set2, data_all,
+                    results_subgroup, results_heterogeneity,
+                    moderator_display_cc, moderator_labels_cc, show_lnrr_top=TRUE)
+
+# Figures 5-6: environmental moderators
+fig5 <- make_figure(inds_set1, data_all,
+                    results_subgroup_env, results_heterogeneity_env,
+                    moderator_display_env, moderator_labels_env, show_lnrr_top=FALSE)
+fig6 <- make_figure(inds_set2, data_all,
+                    results_subgroup_env, results_heterogeneity_env,
+                    moderator_display_env, moderator_labels_env, show_lnrr_top=FALSE)
+
+save_fig <- function(fig, name, n_panels, has_lnrr=TRUE) {
+  w <- if (n_panels==3) 11 else if (n_panels==4) 14 else if (n_panels==5) 17 else 11
+  h <- if (has_lnrr) 11 else 9
+  ggsave(paste0("outputs/", name, ".pdf"), fig, width=w, height=h, dpi=300)
+  ggsave(paste0("outputs/", name, ".jpg"), fig, width=w, height=h, dpi=300)
+}
+save_fig(fig3,"Figure 3",5,TRUE);  print(fig3)
+save_fig(fig4,"Figure 4",5,TRUE);  print(fig4)
+save_fig(fig5,"Figure 5",5,FALSE); print(fig5)
+save_fig(fig6,"Figure 6",5,FALSE); print(fig6)
+```
+
+
+# Figure S1. Publication bias
+
+```{r figureS1}
+# Funnel plots and Egger's test, using observations with reported SD only
+# and trimming extreme standard errors (> median + 6 x MAD)
+real_sd_only  <- TRUE
+TRIM_OUTLIERS <- TRUE
+TRIM_MAD      <- 6
+
+ind_order <- unlist(group_list)
+ind_order <- ind_order[paste0(ind_order, "_C") %in% colnames(data_all)]
+
+get_es <- function(ind){
+  es <- build_es(paste0(ind, "_C"))
+  if (is.null(es)) return(NULL)
+  if (real_sd_only && "is_imp" %in% names(es)) es <- es[!es$is_imp, , drop=FALSE]
+  if (nrow(es) == 0) return(es)
+  if (TRIM_OUTLIERS) {
+    se   <- sqrt(es$vi)
+    madv <- mad(se, na.rm=TRUE)
+    cap  <- median(se, na.rm=TRUE) + TRIM_MAD * madv
+    if (!is.finite(cap) || madv == 0) cap <- max(se, na.rm=TRUE)
+    es <- es[se <= cap, , drop=FALSE]
+  }
+  es
+}
+
+# Keep indicators with at least 5 studies
+ind_keep <- ind_order[sapply(ind_order, function(ind){
+  e <- get_es(ind)
+  !is.null(e) && length(unique(e$StudyID)) >= 5 })]
+
+funnel_pts <- bind_rows(lapply(ind_keep, function(ind){
+  es <- get_es(ind)
+  data.frame(Indicator=ind, yi=es$yi, se=sqrt(es$vi)) }))
+
+# Pseudo 95% confidence limits around zero
+funnel_band <- bind_rows(lapply(ind_keep, function(ind){
+  se_max <- max(sqrt(get_es(ind)$vi), na.rm=TRUE)
+  s <- seq(0, se_max, length.out=100); center <- 0
+  data.frame(Indicator=ind, se=s, lwr=center-1.96*s, upr=center+1.96*s) }))
+
+lev <- ind_keep
+funnel_pts$Indicator  <- factor(funnel_pts$Indicator,  levels=lev)
+funnel_band$Indicator <- factor(funnel_band$Indicator, levels=lev)
+panel_labels <- setNames(paste0("(", letters[seq_along(lev)], ") ", lab_of(lev)), lev)
+
+pf <- ggplot() +
+  geom_line(data=funnel_band, aes(x=lwr, y=se), linetype="dashed", color="grey55", linewidth=.6) +
+  geom_line(data=funnel_band, aes(x=upr, y=se), linetype="dashed", color="grey55", linewidth=.6) +
+  geom_vline(xintercept=0, color="grey35", linewidth=.6) +
+  geom_point(data=funnel_pts, aes(x=yi, y=se),
+             shape=21, size=2.8, stroke=.5, color="black", fill="grey70", alpha=.75) +
+  scale_y_reverse() +
+  facet_wrap(~Indicator, scales="free", labeller=labeller(Indicator=panel_labels)) +
+  theme_classic(base_size=20) +
+  theme(strip.background=element_rect(fill="grey92", color="black", linewidth=1.0),
+        strip.text=element_text(face="bold", size=14),
+        axis.text.y=element_text(size=12), axis.text.x=element_text(size=11),
+        axis.title=element_text(size=16), legend.position="none",
+        panel.spacing=unit(.6,"lines"),
+        panel.border=element_rect(color="black", fill=NA, linewidth=1.0),
+        panel.grid=element_blank(),
+        axis.ticks=element_line(color="black", linewidth=.8), axis.line=element_blank()) +
+  labs(x="Log ratio of means (LnRR)", y="Standard error")
+print(pf)
+ggsave("outputs/Figure S1.pdf", pf, width=18, height=12, dpi=300)
+ggsave("outputs/Figure S1.jpg", pf, width=18, height=12, dpi=300)
+
+# Egger's regression test (multilevel, moderator = SE)
+bias_results <- data.frame()
+for (ind in ind_keep){
+  es  <- get_es(ind)
+  egg <- tryCatch(rma.mv(yi=yi, V=vi, mods=~sqrt(vi), random=~1|StudyID,
+                         data=es, method="REML", sparse=TRUE), error=function(e) NULL)
+  if (is.null(egg)) next
+  bias_results <- bind_rows(bias_results, data.frame(
+    Indicator=ind, N_obs=nrow(es), N_study=length(unique(es$StudyID)),
+    Egger_slope=egg$b[2], Egger_p=egg$pval[2],
+    Asymmetry=ifelse(egg$pval[2] < .05, "yes", "no"))) }
+bias_results <- bias_results %>%
+  mutate(Egger_p_fmt=ifelse(Egger_p<.001, "<0.001", sprintf("%.3f", Egger_p)))
+print(bias_results)
+```
+
+
+# Figure 7a. Correlation heatmap (study level)
+
+```{r figure7a}
+heatmap_indicators <- c("BD","Aggregate","SWC","Penetration",
+                        "OC","N","P","pH",
+                        "Enzyme","Nmineralization","Yield")
+ind_group <- c(
+  BD="Physical properties",Aggregate="Physical properties", SWC="Physical properties", Penetration="Physical properties",
+  OC="Chemical properties", N="Chemical properties", P="Chemical properties",
+  pH="Chemical properties",
+  Enzyme="Biological properties", Nmineralization="Biological properties",
+  Yield="Crop productivity")
+ind_order <- heatmap_indicators
+group_colors_axis <- c("Physical properties"="#E07B6A","Chemical properties"="#E8A950",
+                       "Biological properties"="#4BADB5","Crop productivity"="#9B7EC8")
+
+# Observation-level lnRR
+lnrr_long <- data.frame()
+for (ind in paste0(heatmap_indicators, "_C")) {
+  if (!ind %in% colnames(data_all)) next
+  cp <- which(colnames(data_all) == ind)
+  tmp <- data_all %>%
+    select(StudyID, all_of(colnames(data_all)[cp:(cp+3)])) %>%
+    setNames(c("StudyID","C_mean","T_mean","C_SD","T_SD")) %>%
+    mutate(across(c(C_mean,T_mean), ~suppressWarnings(as.numeric(.)))) %>%
+    filter(!is.na(C_mean), !is.na(T_mean), C_mean>0, T_mean>0) %>%
+    mutate(LnRR = log(T_mean/C_mean), Indicator = substr(ind,1,nchar(ind)-2)) %>%
+    filter(is.finite(LnRR)) %>%
+    select(StudyID, Indicator, LnRR)
+  lnrr_long <- bind_rows(lnrr_long, tmp)
+}
+
+# Study-level mean lnRR for each indicator
+lnrr_wide <- lnrr_long %>%
+  group_by(StudyID, Indicator) %>%
+  summarise(LnRR = mean(LnRR, na.rm=TRUE), .groups="drop") %>%
+  pivot_wider(names_from=Indicator, values_from=LnRR) %>%
+  select(StudyID, any_of(ind_order))
+
+# Pairwise Pearson correlations (n_pair = number of paired studies)
+ind_available <- ind_order[ind_order %in% colnames(lnrr_wide)]
+mat <- lnrr_wide %>% select(all_of(ind_available)) %>% as.matrix()
+n_ind <- length(ind_available)
+cor_mat   <- matrix(NA, n_ind, n_ind, dimnames=list(ind_available, ind_available))
+pval_mat  <- matrix(NA, n_ind, n_ind, dimnames=list(ind_available, ind_available))
+npair_mat <- matrix(0L, n_ind, n_ind, dimnames=list(ind_available, ind_available))
+for (i in seq_len(n_ind)) for (j in seq_len(n_ind)) {
+  x <- mat[,i]; y <- mat[,j]; valid <- !is.na(x) & !is.na(y); np <- sum(valid)
+  npair_mat[i,j] <- np
+  if (i==j) { cor_mat[i,j] <- 1; pval_mat[i,j] <- 0; next }
+  if (np >= 3) { ct <- cor.test(x[valid], y[valid], method="pearson")
+                 cor_mat[i,j] <- ct$estimate; pval_mat[i,j] <- ct$p.value }
+}
+
+# Lower-triangle long format
+cor_df <- as.data.frame(cor_mat) %>% mutate(Var1=ind_available) %>%
+  pivot_longer(-Var1, names_to="Var2", values_to="r") %>%
+  left_join(as.data.frame(pval_mat) %>% mutate(Var1=ind_available) %>%
+              pivot_longer(-Var1, names_to="Var2", values_to="pval"), by=c("Var1","Var2")) %>%
+  left_join(as.data.frame(npair_mat) %>% mutate(Var1=ind_available) %>%
+              pivot_longer(-Var1, names_to="Var2", values_to="n_pair"), by=c("Var1","Var2")) %>%
+  mutate(sig_label=case_when(Var1==Var2~"", is.na(pval)~"", pval<0.001~"***",
+                             pval<0.01~"**", pval<0.05~"*", TRUE~""),
+         is_diag=(Var1==Var2),
+         i_idx=match(Var1, rev(ind_available)), j_idx=match(Var2, ind_available),
+         Var1=factor(Var1, levels=rev(ind_available)),
+         Var2=factor(Var2, levels=ind_available)) %>%
+  filter(i_idx + j_idx <= n_ind + 1)
+
+axis_colors_x <- group_colors_axis[ind_group[ind_available]]
+axis_colors_y <- group_colors_axis[ind_group[rev(ind_available)]]
+
+n <- n_ind
+p_heat <- ggplot(cor_df, aes(Var2, Var1)) +
+  geom_tile(data=cor_df %>% filter(!is_diag), aes(fill=r), color="white", linewidth=0.4) +
+  geom_tile(data=cor_df %>% filter(is_diag), fill="gray92", color="white", linewidth=0.4) +
+  geom_text(data=cor_df %>% filter(!is_diag, !is.na(r), sig_label!=""),
+            aes(label=sig_label), size=4.5, vjust=0.8, color="black") +
+  scale_fill_gradient2(low="#2166AC", mid="#F5EFE3", high="#D6604D", midpoint=0,
+                       limits=c(-1,1), na.value=NA, name="Pearson r",
+                       guide=guide_colorbar(barwidth=1.2, barheight=10, title.position="top")) +
+  scale_x_discrete(limits=ind_available, labels=lab_of) + scale_y_discrete(limits=rev(ind_available), labels=lab_of) +
+  annotate("segment", x=0.5, xend=0.5, y=0.5, yend=n+0.5, color="black", linewidth=0.8) +
+  annotate("segment", x=0.5, xend=n+0.5, y=0.5, yend=0.5, color="black", linewidth=0.8) +
+  annotate("segment", x=seq(0.5,n-0.5), xend=seq(1.5,n+0.5),
+           y=seq(n+0.5,1.5), yend=seq(n+0.5,1.5), color="black", linewidth=0.8) +
+  annotate("segment", x=seq(1.5,n+0.5), xend=seq(1.5,n+0.5),
+           y=seq(n+0.5,1.5), yend=seq(n-0.5,0.5), color="black", linewidth=0.8) +
+  coord_fixed() + theme_minimal(base_size=13) +
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=15, face="bold", color=axis_colors_x),
+        axis.text.y=element_text(size=15, face="bold", color=axis_colors_y),
+        axis.title=element_blank(), panel.grid=element_blank(),
+        legend.title=element_text(size=13), legend.text=element_text(size=12),
+        plot.margin=margin(10,10,10,10))
+p_heat <- p_heat +
+  guides(fill = guide_colorbar(barwidth = 1.0, barheight = 7, title.position = "top")) +
+  theme(legend.position     = c(0.78, 0.74),
+        legend.justification = c(0, 0.5),
+        legend.background    = element_blank(),
+        legend.title         = element_text(size = 12),
+        legend.text          = element_text(size = 10.5))
+print(p_heat)
+```
+
+
+# Figure 7. Correlation network (study level)
+
+```{r figure7}
+nodes_net <- data.frame(name=ind_available,
+                        group=unname(ind_group[ind_available]), stringsAsFactors=FALSE)
+idx <- which(upper.tri(cor_mat), arr.ind=TRUE)
+edges_all <- data.frame(from=rownames(cor_mat)[idx[,1]], to=colnames(cor_mat)[idx[,2]],
+                        r=cor_mat[idx], pval=pval_mat[idx], n_pair=npair_mat[idx],
+                        stringsAsFactors=FALSE)
+group_colors_net <- group_colors_axis
+
+# Edges: |r| >= 0.2, p < 0.05 and at least 5 paired studies
+R_THRESHOLD <- 0.2; P_THRESHOLD <- 0.05; N_THRESHOLD <- 5
+edges_filtered <- edges_all %>%
+  filter(!is.na(r), !is.na(pval), abs(r)>=R_THRESHOLD, pval<P_THRESHOLD, n_pair>=N_THRESHOLD) %>%
+  mutate(edge_type=factor(ifelse(r>0,"Positive","Negative"), levels=c("Positive","Negative")),
+         weight=abs(r))
+
+g <- graph_from_data_frame(
+  d=edges_filtered %>% select(from,to,weight,r,pval,edge_type,n_pair),
+  vertices=nodes_net, directed=FALSE)
+V(g)$degree      <- degree(g)
+V(g)$strength    <- strength(g, weights=E(g)$weight)   # node strength = sum of |r|
+
+# Louvain community detection
+set.seed(123)
+communities <- cluster_louvain(g, weights=E(g)$weight)
+V(g)$module <- as.character(membership(communities))
+
+node_stats <- data.frame(Indicator=V(g)$name, Group=V(g)$group, Module=V(g)$module,
+  Degree=V(g)$degree, Strength=round(V(g)$strength,3)) %>%
+  as_tibble() %>% arrange(desc(Strength))
+print(as.data.frame(node_stats))
+
+mods <- sort(unique(V(g)$module))
+pal_mod <- c("#222222","#888888","#C9A227","#3B7A57","#7B5EA7","#B5651D")
+module_stroke_colors <- setNames(pal_mod[seq_along(mods)], mods)
+g_tidy <- as_tbl_graph(g)
+
+set.seed(42)
+p_net <- ggraph(g_tidy, layout="stress") +
+  geom_edge_link(aes(edge_width=weight, edge_color=edge_type, edge_alpha=weight)) +
+  scale_edge_width(range=c(0.5,3.2), name="|r|", breaks=c(0.2,0.4,0.6)) +
+  scale_edge_alpha(range=c(0.4,0.9), guide="none") +
+  scale_edge_color_manual(values=c(Positive="#D6604D", Negative="#2166AC"),
+                          name="Correlation", drop=FALSE) +
+  geom_node_point(aes(size=strength, fill=group, color=module), shape=21, stroke=2.2) +
+  scale_size_continuous(range=c(8,18), name="Strength", breaks=pretty(V(g)$strength, n=4)) +
+  scale_fill_manual(values=group_colors_net, name="Function group") +
+  scale_color_manual(values=module_stroke_colors, name="Module") +
+  geom_node_text(aes(label=lab_of(name)), size=4.5, fontface="bold", color="black") +
+  scale_x_continuous(expand=expansion(mult=c(0.18,0.18))) +
+  scale_y_continuous(expand=expansion(mult=c(0.12,0.12))) +
+  theme_void(base_size=13) + theme(legend.position="none", plot.margin=margin(10,10,10,10))
+
+# Inset bar chart of node strength
+node_stats_plot <- node_stats %>%
+  mutate(Indicator = factor(Indicator, levels = Indicator[order(Strength)]))
+yc <- group_colors_net[node_stats_plot$Group[order(node_stats_plot$Strength)]]
+
+p_bar_inset <- ggplot(node_stats_plot, aes(Strength, Indicator)) +
+  geom_col(aes(fill = Group), width = 0.72, alpha = 0.9) +
+  geom_text(aes(label = sprintf("%.2f", Strength)),
+            hjust = -0.18, size = 3.6, fontface = "bold", color = "grey30") +
+  scale_fill_manual(values = group_colors_net, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.42))) +
+  scale_y_discrete(labels = lab_of) + labs(x = NULL, y = NULL, subtitle = "Strength") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.y     = element_text(size = 11.5, face = "bold", color = yc),
+        axis.text.x     = element_blank(),
+        axis.ticks      = element_blank(),
+        panel.grid      = element_blank(),
+        plot.subtitle   = element_text(size = 13.5, face = "bold", color = "grey25",
+                                       margin = margin(b = 2)),
+        plot.background = element_rect(fill = "white", color = "grey85", linewidth = 0.4),
+        plot.margin     = margin(4, 6, 4, 4))
+
+p_b <- p_net +
+  inset_element(p_bar_inset, left = 0.00, bottom = 0.05, right = 0.40, top = 0.54,
+                align_to = "panel")
+
+# Combine (a) heatmap and (b) network
+p_combined <- wrap_plots(p_heat, wrap_elements(p_b), ncol = 2, widths = c(1, 1.4)) +
+  plot_annotation(tag_levels = list(c("(a)", "(b)"))) &
+  theme(plot.tag = element_text(size = 18, face = "bold"), plot.tag.position = c(0.02, 0.98))
+
+print(p_combined)
+ggsave("outputs/Figure 7.pdf", p_combined, width = 15, height = 8, dpi = 300)
+ggsave("outputs/Figure 7.jpg", p_combined, width = 15, height = 8, dpi = 300)
+```
+
+
+# Figure 8. Soil health index (AHP weighting)
+
+```{r figure8}
+cat_to_long <- c(
+  Physical    = "Physical properties",
+  Chemical    = "Chemical properties",
+  Biological  = "Biological properties",
+  Crop        = "Crop productivity",
+  Environment = "Environmental impacts",
+  GHG         = "Greenhouse gas emissions")
+
+# Indicator orientation: positive = higher is better, negative = lower is better.
+# pH is oriented by baseline pH class (see below).
+negative_indicators <- c("BD","Penetration","Erosion","Leaching","Weed","N2O","CH4","CO2")
+ph_lo <- 6.5; ph_hi <- 7.5
+
+# AHP weights from 10 expert questionnaires (row geometric mean per questionnaire,
+# aggregated by arithmetic mean of individual priorities; all CR <= 0.1).
+# Pairwise comparison matrices are given in Supplementary Excel S1.
+categories <- c("Physical", "Chemical", "Biological", "Crop", "Environment", "GHG")
+
+# Criterion layer (6 categories)
+cat_weights <- c(Physical = 0.164985, Chemical    = 0.152570, Biological = 0.211857,
+                 Crop     = 0.276622, Environment = 0.104521, GHG        = 0.089444)
+
+# Indicator layer (within each category)
+phys_inds <- c("BD", "Aggregate", "Porosity", "SWC", "Penetration")
+phys_w    <- c(0.202382, 0.339620, 0.146336, 0.205754, 0.105907)
+
+chem_inds <- c("OC", "N", "P", "K", "pH")
+chem_w    <- c(0.405648, 0.191921, 0.117007, 0.092618, 0.192807)
+
+bio_inds  <- c("SoilFauna", "Fungal", "Enzyme", "Nmineralization")
+bio_w     <- c(0.226699, 0.251373, 0.305401, 0.216527)
+
+crop_inds <- c("BiomassCash", "Yield")
+crop_w    <- c(0.385238, 0.614762)
+
+env_inds  <- c("Weed", "Erosion", "Leaching")
+env_w     <- c(0.237677, 0.432794, 0.329529)
+
+ghg_inds  <- c("N2O", "CO2", "CH4")
+ghg_w     <- c(0.393764, 0.326376, 0.279859)
+
+# Consistency ratio range across the 10 questionnaires
+# (the 2 x 2 crop matrix is always consistent)
+ahp_CR_range <- data.frame(
+  Level   = c("Criteria", "Physical", "Chemical", "Biological",
+              "Crop", "Environment", "GHG"),
+  n_items = c(6, 5, 5, 4, 2, 3, 3),
+  CR_min  = c(0.0412, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000),
+  CR_max  = c(0.0997, 0.0962, 0.0981, 0.0965, 0.0000, 0.0739, 0.0930))
+
+# Normalise each layer to sum to 1
+names(phys_w) <- phys_inds; names(chem_w) <- chem_inds; names(bio_w)  <- bio_inds
+names(crop_w) <- crop_inds; names(env_w)  <- env_inds;  names(ghg_w)  <- ghg_inds
+cat_weights <- cat_weights / sum(cat_weights)
+phys_w <- phys_w/sum(phys_w); chem_w <- chem_w/sum(chem_w); bio_w  <- bio_w /sum(bio_w)
+crop_w <- crop_w/sum(crop_w); env_w  <- env_w /sum(env_w);  ghg_w  <- ghg_w /sum(ghg_w)
+
+# Global weight = category weight x indicator weight
+make_global <- function(cn, lw, in_) data.frame(Indicator = in_, Category = cn,
+                          AHP_Global = as.numeric(cat_weights[cn] * lw))
+ahp_global <- bind_rows(
+  make_global("Physical",    phys_w, phys_inds),
+  make_global("Chemical",    chem_w, chem_inds),
+  make_global("Biological",  bio_w,  bio_inds),
+  make_global("Crop",        crop_w, crop_inds),
+  make_global("Environment", env_w,  env_inds),
+  make_global("GHG",         ghg_w,  ghg_inds))
+combined <- ahp_global %>% mutate(Combined_Weight = AHP_Global/sum(AHP_Global)) %>%
+  arrange(desc(Combined_Weight))
+print(as.data.frame(combined))
+
+# Pooled effect for one indicator (multilevel model, with fallbacks for small samples)
+meta_estimate <- function(ind_C, df) {
+  es <- build_es(ind_C, df=df)
+  if (is.null(es)) return(data.frame(est=NA_real_, lo=NA_real_, hi=NA_real_,
+                                     n_obs=0L, n_study=0L, method="none"))
+  n_obs<-nrow(es); n_study<-length(unique(es$StudyID))
+  fit <- if (n_study>=2) tryCatch(rma.mv(yi, V=vi, random=~1|StudyID, data=es,
+                          method="REML", sparse=TRUE), error=function(e) NULL) else NULL
+  if (!is.null(fit))
+    return(data.frame(est=as.numeric(fit$b)[1], lo=fit$ci.lb, hi=fit$ci.ub,
+                      n_obs=n_obs, n_study=n_study, method="rma.mv"))
+  ff <- tryCatch(rma(yi, vi, data=es, method="FE"), error=function(e) NULL)
+  if (!is.null(ff))
+    return(data.frame(est=as.numeric(ff$b)[1], lo=ff$ci.lb, hi=ff$ci.ub,
+                      n_obs=n_obs, n_study=n_study, method="FE"))
+  w<-1/es$vi; e<-sum(es$yi*w)/sum(w); s<-sqrt(1/sum(w))
+  data.frame(est=e, lo=e-1.96*s, hi=e+1.96*s, n_obs=n_obs, n_study=n_study, method="wmean")
+}
+
+# pH orientation by baseline (control) pH: increase is beneficial in acidic soils (< 6.5),
+# detrimental in alkaline soils (> 7.5) and neutral otherwise
+build_pH_strat <- function(df, ph_lo=6.5, ph_hi=7.5) {
+  cp <- which(colnames(df)=="pH_C")
+  ed <- data.frame(StudyID = df[["StudyID"]],
+                   No_C = suppressWarnings(as.numeric(df[["No_C"]])),
+                   No_T = suppressWarnings(as.numeric(df[["No_T"]])),
+                   C_mean = df[[cp]],   T_mean = df[[cp+1]],
+                   C_SD   = df[[cp+2]], T_SD   = df[[cp+3]]) %>%
+    filter(!is.na(C_mean),!is.na(T_mean),!is.na(No_C),!is.na(No_T),C_mean>0,T_mean>0)
+  cvC <- get_cv(ed$C_SD, ed$C_mean); if(!is.finite(cvC)) cvC <- cvC_global
+  cvT <- get_cv(ed$T_SD, ed$T_mean); if(!is.finite(cvT)) cvT <- cvT_global
+  ed <- ed %>% mutate(C_SD=ifelse(is.na(C_SD), C_mean*cvC, C_SD),
+                      T_SD=ifelse(is.na(T_SD), T_mean*cvT, T_SD))
+  es <- escalc(measure="ROM", m1i=T_mean, sd1i=T_SD, n1i=No_T,
+                              m2i=C_mean, sd2i=C_SD, n2i=No_C, data=ed)
+  es %>% filter(is.finite(yi), is.finite(vi), vi>0) %>%
+    mutate(pH_group = case_when(C_mean <  ph_lo ~ "acidic",
+                                C_mean >  ph_hi ~ "alkaline",
+                                TRUE            ~ "neutral"))
+}
+pool_es <- function(es) {
+  if (is.null(es) || nrow(es)==0) return(list(est=NA_real_,lo=NA_real_,hi=NA_real_,n=0L,k=0L,method="none"))
+  n<-nrow(es); k<-length(unique(es$StudyID))
+  fit <- if(k>=2) tryCatch(rma.mv(yi,V=vi,random=~1|StudyID,data=es,method="REML",sparse=TRUE),error=function(e)NULL) else NULL
+  if(!is.null(fit)) return(list(est=as.numeric(fit$b)[1],lo=fit$ci.lb,hi=fit$ci.ub,n=n,k=k,method="rma.mv"))
+  ff <- tryCatch(rma(yi,vi,data=es,method="FE"),error=function(e)NULL)
+  if(!is.null(ff)) return(list(est=as.numeric(ff$b)[1],lo=ff$ci.lb,hi=ff$ci.ub,n=n,k=k,method="FE"))
+  w<-1/es$vi; e<-sum(es$yi*w)/sum(w); s<-sqrt(1/sum(w))
+  list(est=e,lo=e-1.96*s,hi=e+1.96*s,n=n,k=k,method="wmean")
+}
+compute_pH_SHI <- function(df, ph_lo=6.5, ph_hi=7.5) {
+  es <- build_pH_strat(df, ph_lo, ph_hi)
+  N  <- nrow(es)
+  sign_map <- c(acidic=1, neutral=0, alkaline=-1)
+  sub <- bind_rows(lapply(c("acidic","neutral","alkaline"), function(g){
+    p   <- pool_es(es %>% filter(pH_group==g))
+    pct <- (exp(p$est)-1)*100
+    lo  <- if(!is.na(p$lo)) (exp(p$lo)-1)*100 else NA_real_
+    hi  <- if(!is.na(p$hi)) (exp(p$hi)-1)*100 else NA_real_
+    se  <- if(!is.na(lo)) (hi-lo)/(2*1.96) else NA_real_
+    data.frame(pH_group=g, n_obs=p$n, n_study=p$k, Method=p$method,
+               Raw_pct=pct, Raw_lo=lo, Raw_hi=hi, se_pct=se, Sign=sign_map[[g]])
+  }))
+  # Combine classes weighted by their share of observations
+  sub$w            <- if (N>0) sub$n_obs/N else 0
+  sub$Oriented_pct <- sub$Sign * sub$Raw_pct
+  sub$Contrib_pct  <- sub$w * sub$Oriented_pct
+  valid <- !is.na(sub$Raw_pct)
+  oriented_pct <- sum(sub$Contrib_pct[valid], na.rm=TRUE)
+  se_or        <- sqrt(sum((sub$w[valid]*sub$Sign[valid]*sub$se_pct[valid])^2, na.rm=TRUE))
+  pall <- pool_es(es)
+  list(sub=sub, N=N, oriented_pct=oriented_pct,
+       oriented_lo=oriented_pct-1.96*se_or, oriented_hi=oriented_pct+1.96*se_or,
+       raw_pct=(exp(pall$est)-1)*100, n_obs=pall$n, n_study=pall$k)
+}
+ph_result <- compute_pH_SHI(data_all, ph_lo, ph_hi)
+print(as.data.frame(ph_result$sub))
+
+# Oriented percentage change for each indicator
+meta_all <- list()
+for (ind_C in indicators) {
+  base <- sub("_C$","",ind_C)
+  if (base == "pH") {
+    direction <- "pH_baseline"
+    raw_pct   <- ph_result$raw_pct
+    oriented  <- ph_result$oriented_pct
+    o_lo      <- ph_result$oriented_lo; o_hi <- ph_result$oriented_hi
+    r <- list(n_obs=ph_result$n_obs, n_study=ph_result$n_study, method="pH_strat")
+  } else {
+    r <- meta_estimate(ind_C, data_all)
+    raw_pct <- (exp(r$est)-1)*100
+    if (!is.na(r$lo)) { lo<-(exp(r$lo)-1)*100; hi<-(exp(r$hi)-1)*100 } else { lo<-NA_real_; hi<-NA_real_ }
+    if (base %in% negative_indicators) {
+      direction <- "negative"; oriented <- -raw_pct; o_lo <- -hi; o_hi <- -lo
+    } else {
+      direction <- "positive"; oriented <- raw_pct;  o_lo <- lo;  o_hi <- hi
+    }
+  }
+  meta_all[[length(meta_all)+1]] <- data.frame(
+    Indicator=base, Direction=direction,
+    n_obs=r$n_obs, n_study=r$n_study, Method=r$method,
+    Raw_pct=raw_pct, Oriented_pct=oriented, Oriented_lo=o_lo, Oriented_hi=o_hi)
+}
+meta_all <- bind_rows(meta_all)
+
+# SHI = sum of AHP weight x oriented percentage change
+combined_with_effect <- meta_all %>%
+  left_join(combined %>% select(Indicator, Category, Combined_Weight), by="Indicator") %>%
+  mutate(Weighted_Pct = Combined_Weight * Oriented_pct)
+radar_data <- combined_with_effect %>% filter(!is.na(Category)) %>%
+  group_by(Category) %>%
+  summarise(Category_Score=sum(Weighted_Pct, na.rm=TRUE), .groups="drop") %>%
+  mutate(Category=factor(Category, levels=categories)) %>%
+  complete(Category, fill=list(Category_Score=0))
+print(as.data.frame(radar_data))
+
+# Radar chart of category contributions
+draw_radar_single <- function(values_pct, fill_color, grid_breaks=NULL) {
+  n_cat<-length(values_pct); angles<-seq(pi/2, pi/2-2*pi, length.out=n_cat+1)[1:n_cat]
+  if (is.null(grid_breaks)) grid_breaks<-c(0,10,20,30,40)
+  v_min <- -4.5; v_max <- max(grid_breaks)
+  val_to_r<-function(v)(v-v_min)/(v_max-v_min); r_zero<-val_to_r(0)
+  make_hex<-function(r) data.frame(x=r*cos(c(angles,angles[1])), y=r*sin(c(angles,angles[1])))
+  grid_df<-do.call(rbind, lapply(seq_along(grid_breaks), function(i){
+    df<-make_hex(val_to_r(grid_breaks[i])); df$grp<-i; df }))
+  zero_hex<-make_hex(r_zero)
+  spoke_df<-data.frame(x0=val_to_r(v_min)*cos(angles), y0=val_to_r(v_min)*sin(angles),
+                       x1=val_to_r(v_max)*cos(angles), y1=val_to_r(v_max)*sin(angles))
+  r_data<-val_to_r(values_pct)
+  df_plot<-data.frame(Category=categories, value=values_pct, angle=angles,
+                      x=r_data*cos(angles), y=r_data*sin(angles))
+  df_closed<-bind_rows(df_plot, df_plot[1,])
+  short_names<-c(Physical="Physical\nproperties", Chemical="Chemical\nproperties",
+                 Biological="Biological\nproperties", Crop="Crop\nproductivity",
+                 Environment="Environmental\nimpacts", GHG="Greenhouse\ngas emissions")
+  lbl_r<-val_to_r(v_max)*1.20
+  label_df <- df_plot %>% mutate(
+    full_name = short_names[as.character(Category)],
+    val_label = sprintf("(%.2f%%)", value),
+    lx = lbl_r*cos(angle), ly = lbl_r*sin(angle),
+    ha = case_when(cos(angle)>0.15~0, cos(angle)< -0.15~1, TRUE~0.5),
+    va_name = case_when(sin(angle)>0.15~0, sin(angle)< -0.15~1, TRUE~0.5),
+    ly_val = ly - 0.34,
+    va_val = case_when(sin(angle)>0.15~0, sin(angle)< -0.15~1, TRUE~0.5),
+    label_color = unname(group_colors[cat_to_long[as.character(Category)]]))
+  tick_df<-data.frame(val=grid_breaks, x=-0.06, y=val_to_r(grid_breaks), lab=paste0(grid_breaks,"%"))
+  ggplot() +
+    geom_path(data=grid_df, aes(x,y,group=factor(grp)), color="grey82", linewidth=0.45) +
+    geom_path(data=zero_hex, aes(x,y), color="grey50", linewidth=0.8) +
+    geom_segment(data=spoke_df, aes(x=x0,y=y0,xend=x1,yend=y1), color="grey82", linewidth=0.45) +
+    geom_polygon(data=df_closed, aes(x,y), fill=fill_color, alpha=0.25, color=NA) +
+    geom_path(data=df_closed, aes(x,y), color=fill_color, linewidth=1.4) +
+    geom_point(data=df_plot, aes(x,y), color=fill_color, size=3.2) +
+    geom_text(data=tick_df, aes(x,y,label=lab), size=5.0, color="black", hjust=1) +
+    geom_text(data=label_df,
+              aes(lx,ly,label=full_name,hjust=ha,vjust=va_name,color=label_color),
+              size=6.5, fontface="bold", lineheight=0.9) +
+    geom_text(data=label_df,
+          aes(lx, ly_val, label=val_label, hjust=ha, vjust=va_val),
+          size=5.5, color="black") +
+    scale_color_identity() +
+    annotate("text", x=0, y=-1.95, label=sprintf("Overall soil health: %.2f%%", sum(values_pct)),
+             size=6.5, color="black", fontface="bold", hjust=0.5) +
+    coord_fixed(xlim=c(-2.1,2.1), ylim=c(-2.15,1.55), clip="off") +
+    theme_void() + theme(plot.margin=margin(20,25,20,25))
+}
+
+values_overall <- radar_data %>% arrange(match(Category, categories)) %>% pull(Category_Score)
+unified_breaks <- seq(0, 9, by = 3)
+p_overall <- draw_radar_single(values_overall, "#4A4A4A", unified_breaks)
+print(p_overall)
+ggsave("outputs/Figure 8.pdf", p_overall, width=10, height=9)
+ggsave("outputs/Figure 8.jpg", p_overall, width=10, height=9, dpi=300)
+
+# Table: oriented effect size of each indicator
+effect_table <- meta_all %>%
+  transmute(Category=combined$Category[match(Indicator, combined$Indicator)],
+            Indicator, Direction, n_obs, n_study, Method,
+            Oriented_pct=round(Oriented_pct,3),
+            CI=ifelse(is.na(Oriented_lo),"NA", sprintf("(%.2f, %.2f)", Oriented_lo, Oriented_hi))) %>%
+  arrange(match(Category, categories))
+print(as.data.frame(effect_table))
+
+# Table: contribution of each indicator and category to the SHI
+shi_wide <- combined_with_effect %>% filter(!is.na(Category)) %>%
+  transmute(Category, Indicator, Weight_pct=round(Combined_Weight*100,3),
+            Overall_pct=Weighted_Pct) %>%
+  arrange(match(Category, categories), desc(Weight_pct))
+display_table <- bind_rows(lapply(categories, function(cn){
+  ir <- shi_wide %>% filter(Category==cn) %>%
+    transmute(Category, Indicator, Weight_pct, Overall_pct=round(Overall_pct,3))
+  sr <- ir %>% summarise(Category=cn, Indicator="  >> Category subtotal",
+              Weight_pct=round(sum(Weight_pct),3), Overall_pct=round(sum(Overall_pct,na.rm=TRUE),3))
+  bind_rows(ir, sr) }))
+grand_row <- shi_wide %>% summarise(Category="TOTAL", Indicator="  >> Overall soil health",
+  Weight_pct=round(sum(Weight_pct),3), Overall_pct=round(sum(Overall_pct,na.rm=TRUE),3))
+display_table <- bind_rows(display_table, grand_row)
+print(as.data.frame(display_table))
+```

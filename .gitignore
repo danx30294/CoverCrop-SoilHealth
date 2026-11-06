@@ -1,0 +1,17 @@
+# R session files
+.RData
+.RDataTmp*
+.Rhistory
+.Rproj.user/
+
+# knitr by-products
+*_cache/
+*_files/
+*.html
+*.knit.md
+
+# Office temporary files
+~$*
+
+# Manuscript draft
+方法和结果.docx
